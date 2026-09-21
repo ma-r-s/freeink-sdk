@@ -115,6 +115,23 @@ void PowerManager::powerDownRailsForSleep() {
   holdRailOff(b.mic.enable, b.mic.enableActiveHigh ? LOW : HIGH);
 }
 
+void PowerManager::armTimerWakeup(const uint64_t micros) {
+  if (micros == 0) {
+    esp_sleep_disable_wakeup_source(ESP_SLEEP_WAKEUP_TIMER);
+    return;
+  }
+  esp_sleep_enable_timer_wakeup(micros);
+}
+
+void PowerManager::deepSleepUntilPowerButtonOrTimer(const uint64_t micros) {
+  // The timer is armed BESIDE the button, never instead of it: a device that
+  // can only be woken by its own schedule is one nobody can pick up.
+  waitForPowerButtonRelease();
+  armPowerButtonWakeup();
+  armTimerWakeup(micros);
+  deepSleep();
+}
+
 void PowerManager::deepSleep() {
   esp_sleep_config_gpio_isolate();
 #if !FREEINK_MCU_C61

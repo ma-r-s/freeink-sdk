@@ -87,7 +87,8 @@ bool writeReg8(uint8_t addr, uint8_t reg, uint8_t val) {
 // must verify/upload one before SoC reads mean anything.
 constexpr uint8_t CW2017_REG_VERSION = 0x00;    // 0xA0 while starting; running versions match 0x0D/0x0F
 constexpr uint8_t CW2017_REG_VCELL_H = 0x02;    // 14-bit VCELL, big-endian over 0x02/0x03
-constexpr uint8_t CW2017_REG_SOC = 0x04;        // integer percent (0x05 = fraction, unused)
+constexpr uint8_t CW2017_REG_SOC = 0x04;        // integer percent
+constexpr uint8_t CW2017_REG_SOC_FRAC = 0x05;   // 1/256 percent, the low byte of the same value
 constexpr uint8_t CW2017_REG_MODE = 0x08;       // soft-reset / sleep control
 constexpr uint8_t CW2017_REG_SOC_ALERT = 0x0B;  // bit7 = profile-loaded / update-enable
 constexpr uint8_t CW2017_REG_BATINFO = 0x10;    // 80-byte profile spans 0x10..0x5F
@@ -249,6 +250,37 @@ bool readGaugeSoc(uint16_t& out) {
   return true;
 }
 
+// SoC in Q8 (percent << 8 | 1/256ths) from the active gauge. false on failure.
+//
+// Only the CW2017 carries a fraction; every other backend reports whole percent
+// shifted up, so callers get one unit everywhere and never have to ask which
+// gauge answered. The validity checks are the integer reader's, because a
+// fraction from a sleeping or half-initialised gauge is not more trustworthy
+// for being finer.
+bool readGaugeSocQ8(uint16_t& out) {
+  const auto& g = BoardConfig::ACTIVE.batteryGauge;
+  if (g.gaugeType == BoardConfig::GaugeType::Cw2017) {
+    // readGaugeSoc() owns the mode/version/range checks and the bounded
+    // re-init, so the integer part comes from there rather than being read
+    // again here with weaker validation.
+    uint16_t soc = 0;
+    if (!readGaugeSoc(soc)) return false;
+    uint8_t frac = 0;
+    // A fraction that will not read is not a failure: the integer part is
+    // still the number every other caller uses, so report it with a zero
+    // fraction rather than losing the reading entirely. The two registers are
+    // read separately, so a carry between them can cost one LSB; that is 1/256
+    // of a percent and below the noise of anything this is used for.
+    if (!readReg8(g.gaugeAddr, CW2017_REG_SOC_FRAC, frac)) frac = 0;
+    out = static_cast<uint16_t>(soc << 8) | frac;
+    return true;
+  }
+  uint16_t soc = 0;
+  if (!readGaugeSoc(soc)) return false;
+  out = static_cast<uint16_t>(soc << 8);
+  return true;
+}
+
 // Battery voltage (mV) from the active gauge, dispatched by type. false on failure.
 bool readGaugeMillivolts(uint16_t& out) {
   const auto& g = BoardConfig::ACTIVE.batteryGauge;
@@ -395,6 +427,18 @@ bool BatteryMonitor::readPercentageChecked(uint16_t& out) const {
   }
   if (!hasAdcBackend()) return false;
   out = percentageFromMillivolts(readMillivolts());
+  return true;
+}
+
+bool BatteryMonitor::readSocQ8(uint16_t& out) const {
+#if FREEINK_BATTERY_I2C_GAUGE
+  if (BoardConfig::ACTIVE.batteryGauge.gaugeAddr != 0) return readGaugeSocQ8(out);
+#endif
+  // No gauge: the ADC and M5 paths have no sub-percent source, so shift the
+  // percent they do have rather than inventing precision that is not there.
+  uint16_t pct = 0;
+  if (!readPercentageChecked(pct)) return false;
+  out = static_cast<uint16_t>(pct << 8);
   return true;
 }
 

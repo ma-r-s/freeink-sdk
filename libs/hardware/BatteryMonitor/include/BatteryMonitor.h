@@ -52,6 +52,20 @@ public:
     // succeeds.
     bool readPercentageChecked(uint16_t& out) const;
 
+    // State of charge at the gauge's FULL resolution: percent in Q8, so the
+    // integer part is the high byte and the low byte is 1/256 of a percent.
+    //
+    // readPercentage() reports whole percent, which on this cell is about
+    // 11 mAh per step -- far too coarse to see a sleeping board move at all,
+    // and the reason measuring a deep-sleep floor looked like a fortnight's
+    // work. The CW2017 carries the fraction in the register directly after the
+    // one we already read, so this costs a single extra byte on a bus the call
+    // has already opened. Gauges with no fraction register report the integer
+    // percent shifted, so the units are the same everywhere.
+    //
+    // false if the gauge could not be read; `out` is untouched then.
+    bool readSocQ8(uint16_t& out) const;
+
     // Read every battery field the active board can report. `supported` is false
     // when the board profile has no battery telemetry path. Per-field `Known`
     // flags distinguish a valid false/zero value from unsupported or failed I/O.
