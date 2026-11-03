@@ -54,6 +54,18 @@ class PowerManager {
   [[noreturn]] static void deepSleep();
 
   // Convenience: wait for release, arm the power-button wakeup, then deep sleep.
+  // Arms an RTC timer alongside whatever else wakes the device, so a sleep
+  // ends by itself after `micros` with nobody touching it. Zero disarms.
+  //
+  // The timer runs off the internal RC oscillator, not a crystal, so expect
+  // percent-level drift over hours; anything needing better must re-anchor on
+  // wake from a real clock rather than trusting the interval.
+  static void armTimerWakeup(uint64_t micros);
+
+  // As deepSleepUntilPowerButton(), plus an RTC timer. `micros` of 0 is
+  // exactly deepSleepUntilPowerButton().
+  [[noreturn]] static void deepSleepUntilPowerButtonOrTimer(uint64_t micros);
+
   [[noreturn]] static void deepSleepUntilPowerButton();
 
   // esp_deep_sleep_start() is documented as not returning, but deepSleep()

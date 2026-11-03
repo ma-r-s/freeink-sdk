@@ -71,6 +71,16 @@ class GfxRendererTarget final : public DrawTarget {
     device.width = static_cast<int16_t>(renderer.getScreenWidth());
     device.height = static_cast<int16_t>(renderer.getScreenHeight());
     device.orientation = static_cast<Orientation>(renderer.getOrientation());
+    // The panel's bezel-covered edge pixels (BoardConfig viewableInsets,
+    // rotated into this orientation). Screen seeds its content rect from
+    // safeRect(), so everything laid out through it clears the glass;
+    // deliberate full-bleed paint keeps using screen().
+    {
+      int top = 0, right = 0, bottom = 0, left = 0;
+      renderer.getOrientedViewableTRBL(&top, &right, &bottom, &left);
+      device.safeArea = Insets{static_cast<int16_t>(top), static_cast<int16_t>(right),
+                               static_cast<int16_t>(bottom), static_cast<int16_t>(left)};
+    }
     // Same inverse-of-render-rotation selector as DisplayTarget: this makes
     // touchToLogical() agree case-for-case with GfxRenderer::tapToLogical, so
     // FreeInkUI components and the firmware's own tap path map taps identically.
@@ -97,6 +107,28 @@ class GfxRendererTarget final : public DrawTarget {
 
   int16_t lineHeight(const FontId font) const override {
     return static_cast<int16_t>(renderer.getLineHeight(gfxFont(font)));
+  }
+
+  // Ink from glyph metrics: drawText puts the baseline `ascender` below the
+  // line top, and a glyph's ink starts `top` above the baseline.
+  // ponytail: ASCII only (status labels, clocks); other text keeps the line box.
+  Rect inkBounds(const FontId font, const char* text, const TextStyle style) const override {
+    const Rect lineBox = DrawTarget::inkBounds(font, text, style);
+    const int fontId = gfxFont(font);
+    const auto it = renderer.getFontMap().find(fontId);
+    if (!text || it == renderer.getFontMap().end()) return lineBox;
+    const int ascender = renderer.getFontAscenderSize(fontId);
+    int top = lineBox.height;
+    int bottom = 0;
+    for (const char* p = text; *p; ++p) {
+      if (static_cast<unsigned char>(*p) >= 0x80) return lineBox;
+      const auto glyph = it->second.getGlyph(static_cast<uint32_t>(*p), fontStyle(style));
+      if (!glyph || glyph->height <= 0) continue;
+      top = std::min(top, ascender - static_cast<int>(glyph->top));
+      bottom = std::max(bottom, ascender - static_cast<int>(glyph->top) + static_cast<int>(glyph->height));
+    }
+    if (top >= bottom) return lineBox;
+    return Rect{0, static_cast<int16_t>(top), lineBox.width, static_cast<int16_t>(bottom - top)};
   }
 
   void fill(const Rect rect, const Paint paint, const uint8_t radius = 0,

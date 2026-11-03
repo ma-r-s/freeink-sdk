@@ -33,6 +33,10 @@ class PanelDriver {
  public:
   virtual ~PanelDriver() = default;
 
+  // Stable controller/backend identity, independent of board defaults.
+  // Custom drivers may leave it unavailable instead of reporting a guessed name.
+  virtual const char* controllerName() const { return nullptr; }
+
   // --- bus configuration (consumed by the facade before begin()) ---
   virtual uint32_t spiHz() const = 0;
   virtual BusyPolarity busyPolarity() const = 0;
@@ -48,6 +52,9 @@ class PanelDriver {
   // --- lifecycle ---
   virtual void begin(EpdBus& bus) = 0;
   virtual void deepSleep(EpdBus& bus) = 0;
+  // Called only after the host's complete frame (including grayscale) finishes.
+  // Retain controller RAM and the partial-refresh baseline; never reset/sleep.
+  virtual void powerOffBetweenFrames(EpdBus& bus) { (void)bus; }
 
   // --- core paint path (load RAM + refresh) ---
   virtual void display(EpdBus& bus, const uint8_t* fb, const uint8_t* prev, RefreshMode mode, bool turnOff) = 0;

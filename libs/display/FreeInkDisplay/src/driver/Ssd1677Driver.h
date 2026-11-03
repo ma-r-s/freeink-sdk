@@ -55,6 +55,22 @@ struct Ssd1677Config {
   bool grayPowerUpFirst = false;
   // Configurations supporting the factory four-tone LUT advertise it.
   bool absoluteGrayscale = false;
+  // Boards without characterized grayscale waveforms must not advertise AA.
+  bool overlayGrayscale = true;
+  bool writeSecondUpdateControlByte = false;  // append zero to CMD 0x21
+  bool restoreInternalTemperature = false;    // CMD 0x18=0x80 after warmed HALF
+  bool blackPulseClean = false;  // HALF: two partials old -> black -> new (Metalio demo)
+  // Factory absolute 4-level LUT override; nullptr selects lut_factory_quality.
+  // Boards with a per-module voltage tail (Metalio) point this at their copy.
+  const unsigned char* factoryGrayLut = nullptr;
+  // 110-byte B/W LUT for FAST refreshes, activated with 0xCC instead of the OTP
+  // fastSeqOverride; nullptr keeps the OTP waveform.
+  const unsigned char* fastLut = nullptr;
+  // 110-byte B/W LUTs for FULL / HALF refreshes, for panels whose OTP waveforms
+  // are not used. Activated with 0xE4 (FULL, loads temperature) / 0xC4 (HALF,
+  // halfRefreshTemp written) instead of the OTP sequences; nullptr keeps OTP.
+  const unsigned char* fullLut = nullptr;
+  const unsigned char* halfLut = nullptr;
 };
 
 // Standard config (Xteink X4 / GDEQ0426T82). Panel mounting (mirror/180°) is NOT
@@ -64,6 +80,7 @@ const Ssd1677Config& ssd1677DefaultConfig();
 
 class Ssd1677Driver : public PanelDriver {
  public:
+  const char* controllerName() const override { return "SSD1677"; }
   explicit Ssd1677Driver(const Ssd1677Config& cfg = ssd1677DefaultConfig());
 
   uint32_t spiHz() const override;
@@ -72,6 +89,7 @@ class Ssd1677Driver : public PanelDriver {
 
   void begin(EpdBus& bus) override;
   void deepSleep(EpdBus& bus) override;
+  void powerOffBetweenFrames(EpdBus& bus) override;
 
   void display(EpdBus& bus, const uint8_t* fb, const uint8_t* prev, RefreshMode mode, bool turnOff) override;
   // Deferred refresh: displayStart() runs the full update (RAM writes,
@@ -92,7 +110,7 @@ class Ssd1677Driver : public PanelDriver {
   GrayscaleCapabilities grayscaleCapabilities(GrayscaleMode mode = GrayscaleMode::Overlay) const override {
     if (mode == GrayscaleMode::Absolute && _cfg.absoluteGrayscale)
       return {GrayscaleEncoding::AbsolutePlanes, GrayscaleBase::Combined, true, false, false};
-    if (mode != GrayscaleMode::Overlay) return {};
+    if (mode != GrayscaleMode::Overlay || !_cfg.overlayGrayscale) return {};
     return {GrayscaleEncoding::OverlayMasks, GrayscaleBase::Separate, true, true, false};
   }
   void copyGrayscaleLsb(EpdBus& bus, const uint8_t* lsb) override;
@@ -108,6 +126,7 @@ class Ssd1677Driver : public PanelDriver {
   void setCustomLut(EpdBus& bus, bool enabled, const unsigned char* data) override;
 
  private:
+  bool _pendingFrameSync = false;
   bool _needsGrayClear = false;
   bool _absoluteInput = false;
   void writeGrayRam(EpdBus& bus, uint8_t command, const uint8_t* data, uint16_t len);
@@ -120,7 +139,7 @@ class Ssd1677Driver : public PanelDriver {
   void powerOn(EpdBus& bus);
   // Documented SSD1677 analog/oscillator shutdown. Used after a 0xFC update
   // when turnOff was requested and by deepSleep().
-  void powerOffController(EpdBus& bus);
+  void powerOffController(EpdBus& bus, uint16_t settleMs = 200);
   void displayImpl(EpdBus& bus, const uint8_t* fb, const uint8_t* prev, RefreshMode mode, bool turnOff, bool async);
 
   const Ssd1677Config& _cfg;
@@ -150,5 +169,24 @@ class Ssd1677Driver : public PanelDriver {
 
 // Singleton accessor (Meyers, zero-heap). Selects the config for the active board.
 PanelDriver& ssd1677Driver();
+
+#if FREEINK_DEVICE_PICCO
+// Onyx Picco panel probe (cached): reads the panel ID over the display pins
+// before the SPI bus starts and records it in ACTIVE.displayControllerVariant.
+enum PiccoPanel : uint8_t {
+  PiccoUnknown = 0,
+  PiccoYrd0426 = 1,
+  PiccoDepg0397 = 2,
+  PiccoOpm040b3 = 3,
+  PiccoSe0400nqw47 = 4,  // the stock "SSD2677" driver path (Ssd2677Driver)
+};
+uint8_t piccoProbePanel();
+#endif
+
+#if FREEINK_DEVICE_STICKY
+// Sticky panel probe (cached): true when the unit carries an SSD2677 instead of
+// the SSD1677 (CMD 0x70 answers 0x07).
+bool stickyHasSsd2677();
+#endif
 
 }  // namespace freeink

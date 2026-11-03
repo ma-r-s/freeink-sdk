@@ -1,10 +1,16 @@
 #include "SecureClient.h"
 
+#include <Network.h>
+
 // wolfSSL is only pulled in when explicitly enabled. This keeps the default SDK
 // build free of the wolfSSL dependency while leaving a single, well-defined
 // integration point for the TLS 1.3 transport.
 #if defined(FREEINK_NET_WOLFSSL)
 #include <wolfssl/ssl.h>
+#if defined(FREEINK_WOLFSSL_RETAIN_INPUT_BUFFER)
+#include <wolfssl/internal.h>
+#include <atomic>
+#endif
 #endif
 
 namespace freeink {
@@ -24,7 +30,44 @@ void SecureClient::setInsecure() { _insecure = true; }
 
 #if defined(FREEINK_NET_WOLFSSL)
 
+#if defined(BOARD_HAS_PSRAM)
+#include <esp_heap_caps.h>
+
 namespace {
+void* wolfPsramMalloc(size_t size) {
+  return heap_caps_malloc_prefer(size, 2, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT,
+                                 MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+}
+
+void wolfPsramFree(void* ptr) {
+  free(ptr);
+}
+
+void* wolfPsramRealloc(void* ptr, size_t size) {
+  return heap_caps_realloc_prefer(ptr, size, 2, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT,
+                                  MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+}
+
+void ensureWolfAllocators() {
+  static bool registered = false;
+  if (!registered) {
+    if (psramFound()) {
+      wolfSSL_SetAllocators(wolfPsramMalloc, wolfPsramFree, wolfPsramRealloc);
+    }
+    registered = true;
+  }
+}
+}  // namespace
+#endif
+
+namespace {
+#if defined(FREEINK_WOLFSSL_RETAIN_INPUT_BUFFER)
+// Admission only, never an allocator hook or a buffer loan. One connection
+// reserves proactively; others retain their existing on-demand allocation path.
+std::atomic<SecureClient*> recordReservationOwner{nullptr};
+constexpr int kFullRecordCapacity = (1 << 14) + 256 + 64;
+#endif
+
 // Bridge wolfSSL's I/O to the underlying WiFiClient transport.
 int wcSend(WOLFSSL* /*ssl*/, char* buf, int sz, void* ctx) {
   auto* t = static_cast<WiFiClient*>(ctx);
@@ -56,6 +99,9 @@ bool isWantIo(const int err) {
 }  // namespace
 
 int SecureClient::connectWithMethod(const char* host, uint16_t port, void* method, const char* label) {
+#if defined(BOARD_HAS_PSRAM)
+  ensureWolfAllocators();
+#endif
 #if defined(FREEINK_WOLFSSL_DEBUG)
   // Routes wolfSSL's internal trace through wolfSSL_Arduino_Serial_Print (the
   // application provides that hook). Shows exactly where a handshake stalls.
@@ -70,10 +116,12 @@ int SecureClient::connectWithMethod(const char* host, uint16_t port, void* metho
   const uint32_t timeoutMs = getTimeout();
   if (abortRequested()) return 0;
   _transport.setConnectionTimeout(timeoutMs);
+  _tcpConnected = false;
   if (!_transport.connect(host, port)) {
     if (Serial) Serial.printf("[SecureClient] TCP connect failed (%s): %s:%u\n", label, host, port);
     return 0;
   }
+  _tcpConnected = true;
   if (abortRequested()) {
     _transport.stop();
     return 0;
@@ -161,6 +209,31 @@ int SecureClient::connectWithMethod(const char* host, uint16_t port, void* metho
   return 1;
 }
 
+void SecureClient::reserveFullRecord() {
+#if defined(FREEINK_WOLFSSL_RETAIN_INPUT_BUFFER)
+  auto* ssl = static_cast<WOLFSSL*>(_ssl);
+  if (!_connected || !ssl) return;
+#ifdef HAVE_MAX_FRAGMENT
+  if (ssl->max_fragment < MAX_RECORD_SIZE) return;
+#endif
+  const auto& input = ssl->buffers.inputBuffer;
+  // Do not relocate unread ciphertext or a buffer still referenced by plaintext.
+  // Normal wolfSSL reads will consume it and grow on demand if necessary.
+  if (input.bufferSize >= kFullRecordCapacity || input.length != input.idx ||
+      ssl->buffers.clearOutputBuffer.length != 0) return;
+  SecureClient* expected = nullptr;
+  if (!recordReservationOwner.compare_exchange_strong(expected, this)) return;
+  // ~16.7 KB is too large for a task stack or permanent DRAM. GrowInputBuffer
+  // allocates through wolfSSL's own allocator and transfers ownership to ssl;
+  // the consumer's retention patch reuses it until wolfSSL_free().
+  if (GrowInputBuffer(ssl, kFullRecordCapacity, 0) != 0) {
+    recordReservationOwner.store(nullptr);
+    if (Serial) Serial.printf("[SecureClient] no full-record buffer, max block %u\n",
+                              (unsigned)ESP.getMaxAllocHeap());
+  }
+#endif
+}
+
 bool SecureClient::abortRequested() {
   if (!_shouldAbort || !_shouldAbort()) return false;
   _aborted = true;
@@ -169,12 +242,15 @@ bool SecureClient::abortRequested() {
 
 int SecureClient::connect(const char* host, uint16_t port) {
   _aborted = false;
+  stop();
+  if (abortRequested() || !hostResolves(host)) return 0;
   // Negotiate the highest mutually supported version rather than pinning TLS 1.3:
   // self-hosted / Let's Encrypt nginx often tops out at TLS 1.2, and a 1.3-only
   // client fails those handshakes outright. v23 still selects 1.3 when the peer
   // offers it (WOLFSSL_TLS13 is enabled) and falls back to 1.2 otherwise.
   if (connectWithMethod(host, port, wolfSSLv23_client_method(), "auto")) return 1;
-  if (_aborted) return 0;
+  // Only a failed handshake can be a TLS version problem; don't retry a dead host.
+  if (_aborted || !_tcpConnected) return 0;
 
   // Some TLS 1.2-only servers are intolerant of a TLS 1.3-capable ClientHello
   // and abort with a fatal handshake_failure alert. Retry with an explicit
@@ -225,6 +301,11 @@ int SecureClient::available() {
 
 void SecureClient::stop() {
   if (_ssl) { wolfSSL_free(static_cast<WOLFSSL*>(_ssl)); _ssl = nullptr; }
+#if defined(FREEINK_WOLFSSL_RETAIN_INPUT_BUFFER)
+  // Release admission only after wolfSSL has freed its connection-owned memory.
+  SecureClient* expected = this;
+  recordReservationOwner.compare_exchange_strong(expected, nullptr);
+#endif
   if (_ctx) { wolfSSL_CTX_free(static_cast<WOLFSSL_CTX*>(_ctx)); _ctx = nullptr; }
   _transport.stop();
   _connected = false;
@@ -247,6 +328,13 @@ void SecureClient::stop() { _transport.stop(); _connected = false; }
 uint8_t SecureClient::connected() { return 0; }
 
 #endif
+
+bool hostResolves(const char* host) {
+  IPAddress ip;
+  if (Network.hostByName(host, ip) == 1) return true;
+  if (Serial) Serial.printf("[SecureNet] DNS lookup failed: %s\n", host);
+  return false;
+}
 
 // --- transport-agnostic single-byte helpers (shared) ---
 size_t SecureClient::write(uint8_t b) { return write(&b, 1); }
