@@ -11,7 +11,8 @@ using namespace OpdsLimits;
 // The JSON tokenizer drops any string longer than its buffer (tokenOverflow
 // skips the onString callback), so every field the parser stores must fit
 // within the buffer's effective capacity or long values would vanish before
-// assignBounded() truncates them. The URL limits are the largest fields.
+// assignBounded() truncates them. The URL limits are the largest such fields;
+// a description too long for the buffer arrives as a prefix where it is trimmed.
 static_assert(MAX_HREF_CHARS < StreamingJsonParser::TOKEN_BUF_SIZE - 1 &&
                   MAX_SEARCH_TEMPLATE_CHARS < StreamingJsonParser::TOKEN_BUF_SIZE - 1 &&
                   MAX_PAGE_URL_CHARS < StreamingJsonParser::TOKEN_BUF_SIZE - 1,
@@ -19,7 +20,7 @@ static_assert(MAX_HREF_CHARS < StreamingJsonParser::TOKEN_BUF_SIZE - 1 &&
 
 Opds2Parser::Opds2Parser()
     : parser(JsonCallbacks{this, &sOnKey, &sOnString, &sOnNumber, &sOnBool, nullptr, &sOnObjectStart, &sOnObjectEnd,
-                           &sOnArrayStart, &sOnArrayEnd}) {
+                           &sOnArrayStart, &sOnArrayEnd, TRIM_CUT_DESCRIPTIONS ? &sOnStringPrefix : nullptr}) {
   entryLimit = reserveFeedEntries(entries);
   if (entryLimit == 0) errorOccured = true;
 }
@@ -374,6 +375,7 @@ void Opds2Parser::onStringValue(const char* value, const size_t len) {
         // Inline feed description: the detail page's source when the
         // publication offers no self document (or that document omits it).
         assignBounded(currentEntry.description, value, len, MAX_DESCRIPTION_CHARS);
+        if (TRIM_CUT_DESCRIPTIONS) trimPartialUtf8(currentEntry.description);
       }
       break;
     case Scope::PUB_TITLE:
@@ -582,6 +584,15 @@ void Opds2Parser::sOnKey(void* ctx, const char* key, size_t len) {
 
 void Opds2Parser::sOnString(void* ctx, const char* value, const size_t len) {
   static_cast<Opds2Parser*>(ctx)->onStringValue(value, len);
+}
+
+// Only a description may be kept cut short; a cut URL or ID would be wrong. It never replaces one already
+// read, since a key too long to report leaves the previous key pending.
+void Opds2Parser::sOnStringPrefix(void* ctx, const char* value, const size_t len) {
+  auto* self = static_cast<Opds2Parser*>(ctx);
+  if (strcmp(self->pendingKey, "description") == 0 && self->currentEntry.description.empty()) {
+    self->onStringValue(value, len);
+  }
 }
 
 void Opds2Parser::sOnNumber(void* ctx, const char* value, size_t) {

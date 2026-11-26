@@ -110,6 +110,7 @@ class Opds2Parser final : public Print {
 
   static void sOnKey(void* ctx, const char* key, size_t len);
   static void sOnString(void* ctx, const char* value, size_t len);
+  static void sOnStringPrefix(void* ctx, const char* value, size_t len);
   static void sOnNumber(void* ctx, const char* value, size_t len);
   static void sOnBool(void* ctx, bool value);
   static void sOnObjectStart(void* ctx);

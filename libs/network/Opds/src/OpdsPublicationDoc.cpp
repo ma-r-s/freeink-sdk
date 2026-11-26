@@ -242,9 +242,10 @@ void pubOnString(void* ud, const char* v, size_t len) {
         set(c.out->title, OpdsLimits::MAX_TITLE_CHARS);
       else if (strcmp(c.key, "author") == 0 && c.out->author.empty())
         set(c.out->author, OpdsLimits::MAX_AUTHOR_CHARS);
-      else if (strcmp(c.key, "description") == 0)
+      else if (strcmp(c.key, "description") == 0) {
         set(c.out->description, 2048);
-      else if (strcmp(c.key, "language") == 0)
+        if (OpdsLimits::TRIM_CUT_DESCRIPTIONS) OpdsLimits::trimPartialUtf8(c.out->description);
+      } else if (strcmp(c.key, "language") == 0)
         set(c.out->language, 32);
       else if (strcmp(c.key, "publisher") == 0)
         set(c.out->publisher, 120);
@@ -392,6 +393,14 @@ void pubOnArrEnd(void* ud) {
   c.key[0] = '\0';
 }
 
+// Only a description may be kept cut short; a cut URL or ID would be wrong. It never replaces one already
+// read, since a key too long to report leaves the previous key pending.
+void pubOnStringPrefix(void* ud, const char* v, size_t len) {
+  auto& c = *static_cast<PubDoc2Ctx*>(ud);
+  if (c.cur() == PubScope::META && strcmp(c.key, "description") == 0 && c.out->description.empty()) {
+    pubOnString(ud, v, len);
+  }
+}
 }  // namespace
 
 bool parseOpdsPublicationDoc(const char* json, const size_t len, OpdsPublication& out, const char* preferredLang) {
@@ -402,8 +411,12 @@ bool parseOpdsPublicationDoc(const char* json, const size_t len, OpdsPublication
     ctx.preferredLang[i] = static_cast<char>((preferredLang[i] >= 'A' && preferredLang[i] <= 'Z') ? preferredLang[i] + 32
                                                                                                   : preferredLang[i]);
   }
-  JsonCallbacks cb{&ctx,    &pubOnKey,      &pubOnString, &pubOnNumber,   nullptr,
-                   nullptr, &pubOnObjStart, &pubOnObjEnd, &pubOnArrStart, &pubOnArrEnd};
+  JsonCallbacks cb{&ctx,           &pubOnKey,
+                   &pubOnString,   &pubOnNumber,
+                   nullptr,        nullptr,
+                   &pubOnObjStart, &pubOnObjEnd,
+                   &pubOnArrStart, &pubOnArrEnd,
+                   OpdsLimits::TRIM_CUT_DESCRIPTIONS ? &pubOnStringPrefix : nullptr};
   StreamingJsonParser parser(cb);
   parser.feed(json, len);
   if (parser.hasError() || ctx.depth != 0) return false;
